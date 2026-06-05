@@ -33,7 +33,9 @@
   #status { padding:8px 14px; background:#16202b; color:#ffd95a;
             font-size:14px; min-height:20px; }
   .canvasWrap { width:100%; background:#0d1419; text-align:center; }
-  canvas#view { width:100%; height:auto; display:block; touch-action:none; }
+  canvas#view { display:block; margin:0 auto; max-width:100%; max-height:78vh;
+                touch-action:none; background:#0d1419; }
+  #zoomBar button { padding:8px 12px; }
   .cuts { display:flex; flex-direction:column; gap:10px; margin-top:6px; }
   .cut { display:flex; align-items:center; gap:10px; }
   .cut label { width:130px; font-size:14px; }
@@ -82,6 +84,15 @@
 
 <div class="canvasWrap"><canvas id="view"></canvas></div>
 
+<div class="pad" style="padding-top:8px;padding-bottom:0">
+  <div class="btnrow" id="zoomBar">
+    <button onclick="zoomBy(1/1.4)">&minus; Zoom</button>
+    <span id="zoomLbl" style="align-self:center;min-width:50px;text-align:center">100%</span>
+    <button onclick="zoomBy(1.4)">+ Zoom</button>
+    <button onclick="resetView()">Reset view</button>
+  </div>
+</div>
+
 <div class="pad">
   <div class="cuts">
     <div class="cut">
@@ -111,10 +122,11 @@
     <th>Tube</th><th>Hue</th><th>% chg</th><th>Call</th>
   </tr></thead><tbody></tbody></table>
 
-  <p class="hint">Tap the photo to place points (Positive control &rarr; Negative
-  control &rarr; each test tube). Pinch-zoom the page to tap small tubes
-  precisely. Calls update live as you move the sliders. To install on your
-  iPhone: Share &rarr; "Add to Home Screen".</p>
+  <p class="hint"><b>Drag</b> to pan, <b>pinch</b> (or the +/&minus; Zoom buttons,
+  or mouse wheel) to zoom in on small tubes, then <b>tap</b> a tube to place a
+  point: Positive control &rarr; Negative control &rarr; each test tube. Calls
+  update live as you move the cut-off sliders. To install on your iPhone:
+  Share &rarr; "Add to Home Screen".</p>
 </div>
 
 <script>
@@ -125,12 +137,21 @@ let sampleData=null;            // Uint8ClampedArray of working-res image
 let view, vctx;
 let st = {white:null, pos:null, neg:null, tubes:[]};
 let mode=null, radius=14, wbGains=null, rows=[], meta={};
+// view (zoom/pan) model — all coords below are canvas backing pixels
+let natW=0, natH=0, Vw=0, Vh=0, dpr=1, kFit=1, k=1, zoom=1, ox=0, oy=0;
+let pointers=new Map(), downPt=null, lastPt=null, moved=false, multi=false, pinch=null;
+const MINZ=1, MAXZ=12, TAP_THRESH=8;
 
 window.onload = () => {
   view = document.getElementById('view');
   vctx = view.getContext('2d');
   document.getElementById('file').addEventListener('change', onFile);
-  view.addEventListener('click', onTap);
+  view.addEventListener('pointerdown', onPointerDown);
+  view.addEventListener('pointermove', onPointerMove);
+  view.addEventListener('pointerup', onPointerUp);
+  view.addEventListener('pointercancel', onPointerUp);
+  view.addEventListener('wheel', onWheel, {passive:false});
+  window.addEventListener('resize', onResize);
 };
 
 // ---------- color math (mirrors validated Python) ----------
@@ -184,8 +205,9 @@ function onFile(e){
     const octx=off.getContext('2d',{willReadFrequently:true});
     octx.drawImage(img,0,0,workW,workH);
     sampleData=octx.getImageData(0,0,workW,workH).data;
-    view.width=workW; view.height=workH;
+    natW=img.naturalWidth; natH=img.naturalHeight;
     st={white:null,pos:null,neg:null,tubes:[]}; wbGains=null; rows=[];
+    setupViewport(); resetView();
     setMode('pos'); recompute();
     setStatus('Loaded. Tap the POSITIVE control tube.');
   };
@@ -204,17 +226,104 @@ function setMode(m){
   ['white','pos','neg','tube'].forEach(k=>
     document.getElementById('b_'+k).classList.toggle('active', k===m));
 }
-function onTap(e){
-  if(!baseImg) return;
-  const r=view.getBoundingClientRect();
-  const x=(e.clientX-r.left)*(view.width/r.width);
-  const y=(e.clientY-r.top)*(view.height/r.height);
-  if(mode==='white'){ st.white=[x,y]; applyWB(); setMode(st.pos?'tube':'pos'); }
-  else if(mode==='pos'){ st.pos=[x,y]; setMode(st.neg?'tube':'neg'); }
-  else if(mode==='neg'){ st.neg=[x,y]; setMode('tube'); }
-  else if(mode==='tube'){ st.tubes.push([x,y]); }
+function placePoint(ix,iy){
+  if(mode==='white'){ st.white=[ix,iy]; applyWB(); setMode(st.pos?'tube':'pos'); }
+  else if(mode==='pos'){ st.pos=[ix,iy]; setMode(st.neg?'tube':'neg'); }
+  else if(mode==='neg'){ st.neg=[ix,iy]; setMode('tube'); }
+  else if(mode==='tube'){ st.tubes.push([ix,iy]); }
   else return;
   recompute();
+}
+
+// ---------- zoom / pan ----------
+function setupViewport(){
+  dpr = window.devicePixelRatio || 1;
+  const cw = Math.max(200, (view.parentElement.clientWidth || 360));
+  Vw = Math.round(cw*dpr);
+  Vh = Math.round(Vw*workH/workW);
+  view.width=Vw; view.height=Vh;
+  kFit = Vw/workW;
+}
+function clampPan(){
+  const iw=workW*k, ih=workH*k;
+  ox = iw<=Vw ? (Vw-iw)/2 : Math.min(0, Math.max(Vw-iw, ox));
+  oy = ih<=Vh ? (Vh-ih)/2 : Math.min(0, Math.max(Vh-ih, oy));
+}
+function resetView(){ zoom=1; k=kFit; ox=0; oy=0; clampPan(); updateZoomLbl(); drawView(); }
+function updateZoomLbl(){ const e=document.getElementById('zoomLbl'); if(e) e.textContent=Math.round(zoom*100)+'%'; }
+function zoomAt(factor, cx, cy){
+  const nz=Math.min(MAXZ, Math.max(MINZ, zoom*factor));
+  if(Math.abs(nz-zoom)<1e-6) return;
+  const ix=(cx-ox)/k, iy=(cy-oy)/k;
+  zoom=nz; k=kFit*zoom;
+  ox=cx-ix*k; oy=cy-iy*k;
+  clampPan(); updateZoomLbl(); drawView();
+}
+function zoomBy(f){ if(baseImg) zoomAt(f, Vw/2, Vh/2); }
+function toCanvas(e){
+  const r=view.getBoundingClientRect();
+  return [ (e.clientX-r.left)*(view.width/r.width), (e.clientY-r.top)*(view.height/r.height) ];
+}
+function onPointerDown(e){
+  if(!baseImg) return;
+  if(view.setPointerCapture){ try{ view.setPointerCapture(e.pointerId);}catch(_){} }
+  const [x,y]=toCanvas(e);
+  pointers.set(e.pointerId,{x,y});
+  if(pointers.size===1){ downPt=[x,y]; lastPt=[x,y]; moved=false; }
+  else if(pointers.size===2){ multi=true; startPinch(); }
+}
+function startPinch(){
+  const p=[...pointers.values()];
+  const dx=p[0].x-p[1].x, dy=p[0].y-p[1].y;
+  const midx=(p[0].x+p[1].x)/2, midy=(p[0].y+p[1].y)/2;
+  pinch={ dist:Math.hypot(dx,dy)||1, ix:(midx-ox)/k, iy:(midy-oy)/k, z0:zoom };
+}
+function onPointerMove(e){
+  if(!pointers.has(e.pointerId)) return;
+  const [x,y]=toCanvas(e);
+  pointers.set(e.pointerId,{x,y});
+  if(pointers.size>=2 && pinch){
+    const p=[...pointers.values()];
+    const dx=p[0].x-p[1].x, dy=p[0].y-p[1].y;
+    const dist=Math.hypot(dx,dy)||1;
+    const midx=(p[0].x+p[1].x)/2, midy=(p[0].y+p[1].y)/2;
+    zoom=Math.min(MAXZ, Math.max(MINZ, pinch.z0*(dist/pinch.dist)));
+    k=kFit*zoom;
+    ox=midx-pinch.ix*k; oy=midy-pinch.iy*k;
+    clampPan(); updateZoomLbl(); drawView();
+  } else if(pointers.size===1){
+    const d=Math.hypot(x-downPt[0], y-downPt[1]);
+    if(moved || d>TAP_THRESH*dpr){
+      moved=true;
+      ox+=x-lastPt[0]; oy+=y-lastPt[1];
+      lastPt=[x,y]; clampPan(); drawView();
+    }
+  }
+}
+function onPointerUp(e){
+  const had=pointers.size;
+  const p=pointers.get(e.pointerId);
+  pointers.delete(e.pointerId);
+  if(had===1 && !moved && !multi && p){
+    const ix=(p.x-ox)/k, iy=(p.y-oy)/k;
+    if(ix>=0 && iy>=0 && ix<workW && iy<workH) placePoint(ix,iy);
+  }
+  if(pointers.size<2) pinch=null;
+  if(pointers.size===0){ multi=false; }
+  else { const r=[...pointers.values()][0]; downPt=[r.x,r.y]; lastPt=[r.x,r.y]; moved=true; }
+}
+function onWheel(e){
+  if(!baseImg) return;
+  e.preventDefault();
+  const [x,y]=toCanvas(e);
+  zoomAt(e.deltaY<0 ? 1.15 : 1/1.15, x, y);
+}
+function onResize(){
+  if(!baseImg) return;
+  const ix=(Vw/2-ox)/k, iy=(Vh/2-oy)/k;
+  setupViewport(); k=kFit*zoom;
+  ox=Vw/2-ix*k; oy=Vh/2-iy*k;
+  clampPan(); drawView();
 }
 function undo(){
   if(st.tubes.length) st.tubes.pop();
@@ -279,23 +388,27 @@ function recompute(){
 
 // ---------- rendering ----------
 function drawView(){
-  if(!baseImg) return;
-  vctx.clearRect(0,0,view.width,view.height);
-  vctx.drawImage(baseImg,0,0,workW,workH);
-  const lw=Math.max(2, Math.round(workW/500));
-  const fs=Math.max(12, Math.round(workW/55));
-  const draw=(xy,col,label,w)=>{
-    vctx.beginPath(); vctx.arc(xy[0],xy[1],radius,0,7);
-    vctx.lineWidth=w; vctx.strokeStyle=col; vctx.stroke();
+  if(!baseImg || !Vw) return;
+  vctx.setTransform(1,0,0,1,0,0);
+  vctx.clearRect(0,0,Vw,Vh);
+  vctx.imageSmoothingEnabled=true;
+  // draw the (possibly zoomed/panned) image
+  vctx.drawImage(baseImg, 0,0,natW,natH, ox,oy, workW*k, workH*k);
+  // markers: position scales with zoom, but line/text stay constant on screen
+  const lw=2*dpr, fs=13*dpr;
+  const draw=(xy,col,label,extra)=>{
+    const cx=xy[0]*k+ox, cy=xy[1]*k+oy, rr=radius*k;
+    vctx.beginPath(); vctx.arc(cx,cy,rr,0,7);
+    vctx.lineWidth=lw+extra; vctx.strokeStyle=col; vctx.stroke();
     vctx.font='bold '+fs+'px sans-serif'; vctx.fillStyle=col;
     vctx.textAlign='center'; vctx.textBaseline='bottom';
-    vctx.fillText(label, xy[0], xy[1]-radius-4);
+    vctx.fillText(label, cx, cy-rr-4*dpr);
   };
-  if(st.white) draw(st.white,'#ffffff','WB',lw);
-  if(st.pos) draw(st.pos,'#fdd835','POS',lw+1);
-  if(st.neg) draw(st.neg,'#fdd835','NEG',lw+1);
+  if(st.white) draw(st.white,'#ffffff','WB',0);
+  if(st.pos) draw(st.pos,'#fdd835','POS',dpr);
+  if(st.neg) draw(st.neg,'#fdd835','NEG',dpr);
   rows.forEach(r=>{ if(typeof r.tube==='number')
-    draw([r.x,r.y],COLORS[r.call], r.tube+' '+r.call.slice(0,3)+' '+Math.round(r.pct_change)+'%', lw); });
+    draw([r.x,r.y],COLORS[r.call], r.tube+' '+r.call.slice(0,3)+' '+Math.round(r.pct_change)+'%', 0); });
 }
 function updateTable(){
   const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
@@ -337,8 +450,23 @@ function saveCSV(){
 }
 function saveImage(){
   if(!baseImg){ alert('Load a photo first.'); return; }
-  drawView();
-  view.toBlob(b=>download('LAMP_annotated.png', b), 'image/png');
+  // render the FULL image with markers, regardless of current zoom
+  const c=document.createElement('canvas'); c.width=workW; c.height=workH;
+  const x=c.getContext('2d'); x.drawImage(baseImg,0,0,workW,workH);
+  const lw=Math.max(2, Math.round(workW/500)), fs=Math.max(12, Math.round(workW/55));
+  const dm=(xy,col,label,extra)=>{
+    x.beginPath(); x.arc(xy[0],xy[1],radius,0,7);
+    x.lineWidth=lw+extra; x.strokeStyle=col; x.stroke();
+    x.font='bold '+fs+'px sans-serif'; x.fillStyle=col;
+    x.textAlign='center'; x.textBaseline='bottom';
+    x.fillText(label, xy[0], xy[1]-radius-4);
+  };
+  if(st.white) dm(st.white,'#ffffff','WB',0);
+  if(st.pos) dm(st.pos,'#fdd835','POS',1);
+  if(st.neg) dm(st.neg,'#fdd835','NEG',1);
+  rows.forEach(r=>{ if(typeof r.tube==='number')
+    dm([r.x,r.y],COLORS[r.call], r.tube+' '+r.call.slice(0,3)+' '+Math.round(r.pct_change)+'%', 0); });
+  c.toBlob(b=>download('LAMP_annotated.png', b), 'image/png');
 }
 function setStatus(t){ document.getElementById('status').textContent=t; }
 </script>
